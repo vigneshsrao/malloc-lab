@@ -42,25 +42,34 @@ team_t team = {
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
 
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+#define PREV_IN_USE 1 /* Set if the previous chunk is not free */
 
 void* heap_start;  /* Pointer to starting of the heap */
 void* top;  /* Pointer to the top chunk */
+void* freelist;
 
 /* Macros for the chunk fields */
-#define prev_size(p) ((size_t*)p)
-#define chunk_size(p) ((size_t *)(p + ALIGNMENT))
-#define fd(p) ((size_t*)p + (size_t)2*ALIGNMENT)
-#define bk(p) ((size_t*)p + (size_t) 3*ALIGNMENT)
+#define get_chunk(p) (p - (void *)0x10)
+#define prev_size(p) (*(size_t*)p)
+#define chunk_size(p) (*(size_t *)((size_t)p + (size_t)ALIGNMENT))
+#define fd(p) (*(size_t*)((size_t)p + (size_t)2*ALIGNMENT))
+#define bk(p) (*(size_t*)((size_t)p + (size_t) 3*ALIGNMENT))
+#define real_size(p) (chunk_size(p) & ~0x7)
+#define next_chunk(p) ((size_t *)(p + real_size(p)))
+#define prev_chunk(p) ((size_t *)(p - prev_size(p)))
 
 void mm_checkheap()
 {
-  printf("\np = %p\n",heap_start);
-  printf("prev size 1st= %x\n",*prev_size(heap_start));
-  printf("size 1st= %x\n",*chunk_size(heap_start));
-
-  printf("\ntop = %p\n",top);
-  printf("prev size top= %x\n",*prev_size(top));
-  printf("size top= %x\n",*chunk_size(top));
+  void* chunk=heap_start;
+  while(chunk!=top){
+    printf("\np=%p\t",chunk);
+    printf("prev_size_p=0x%x\t",prev_size(chunk));
+    printf("size_p=0x%x",chunk_size(chunk));
+    chunk+=chunk_size(chunk);
+  }
+  printf("\ntop=%p\t",chunk);
+  printf("prev_size_top=0x%x\t",prev_size(chunk));
+  printf("size_top=0x%x\n",chunk_size(chunk));
 }
 
 /*
@@ -70,13 +79,14 @@ int mm_init(void)
 {
     top=mem_sbrk(ALIGN(0x31000));
     heap_start=top;
-    //mm_checkheap();
     if(top==(void*)-1){
       printf("\n[ERROR] mem_sbrk failed\n");
       exit(1);
     }
-    //memset(top,0,0x31000);
-    *chunk_size(top) = (size_t)ALIGN(0x31000);
+    chunk_size(top) = (size_t)ALIGN(0x31000);
+    chunk_size(top) |=PREV_IN_USE;
+    freelist=mm_malloc(4*8*3);
+    memset(freelist,0,96);
     //mm_checkheap();
     return 0;
 }
@@ -87,24 +97,19 @@ int mm_init(void)
  */
 void *mm_malloc(size_t size)
 {
-    int newsize = ALIGN(size + SIZE_T_SIZE);
-    // void *p = mem_sbrk(newsize);
-    if((*(int*)chunk_size(top))<newsize){
+    int newsize = ALIGN(size + 2*SIZE_T_SIZE);
+    if(((int)chunk_size(top))<newsize){
       printf("[ERROR] Out of memory !");
       exit(1);
     }
     void* p = top;
-    size_t prev=*chunk_size(top);
+    size_t prev=real_size(top);
     top += newsize;
-    *chunk_size(top)=prev-newsize;
-    *chunk_size(p)=newsize;
+    chunk_size(top)=prev-newsize;
+    chunk_size(p)=newsize;
+    chunk_size(top) |= PREV_IN_USE;
+    chunk_size(p) |=PREV_IN_USE;
     //mm_checkheap();
-    // if (p == (void *)-1)
-	  //     return NULL;
-    // else {
-    //     *(size_t *)p = size;
-    //     return (void *)((char *)p + 2*SIZE_T_SIZE);
-    // }
     return (void *)((char *)p + 2*SIZE_T_SIZE);
 }
 
@@ -113,6 +118,11 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
+  //printf("%zx\n",(size_t)&chunk_size(next_chunk(ptr-0x10)));
+  ptr = (void*)get_chunk(ptr);
+  chunk_size(next_chunk(ptr)) &= ~0x7;
+  fd(freelist)=(size_t)ptr;
+  bk(freelist)=(size_t)ptr;
 }
 
 /*
