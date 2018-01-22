@@ -38,6 +38,8 @@ team_t team = {
 void* traverse();
 void link_to_freelist(void* ptr);
 void* coalesce(void* ptr);
+void unlink_from_freelist(void* ptr);
+
 /* single word (4) or double word (8) alignment */
 #define ALIGNMENT 8
 #define WSIZE 4
@@ -51,53 +53,76 @@ void* coalesce(void* ptr);
 void* heap_start;  /* Pointer to starting of the heap */
 void* top;  /* Pointer to the top chunk */
 void* freelist;
-
+int req=-1;
 /* Macros for the chunk fields */
 #define get_chunk(p) (p - (void *)ALIGNMENT)
 #define prev_size(p) (*(size_t*)p)
 #define chunk_size(p) (*(size_t *)((size_t)p + (size_t)WSIZE))
 #define fd(p) (*(size_t*)((size_t)p + (size_t)2*WSIZE))
 #define bk(p) (*(size_t*)((size_t)p + (size_t)3*WSIZE))
-#define real_size(p) (chunk_size(p) & ~0x7)
+#define real_size(p) ((size_t)(chunk_size(p) & ~0x7))
 #define next_chunk(p) ((size_t *)(p + real_size(p)))
 #define prev_chunk(p) ((size_t *)(p - prev_size(p)))
 #define ALLOC(p) (chunk_size(p) |= PREV_IN_USE)
 #define GET_ALLOC(p) (chunk_size(p) & PREV_IN_USE)
 #define UNALLOC(p) (chunk_size(p) &= ~0x7)
+#define INIT_HEAP_SIZE (size_t)0x1000000
 
 void mm_checkheap()
 {
-  void* chunk=heap_start;
-  while(chunk!=top){
-    printf("\np=%p\t",chunk);
-    printf("prev_size_p=0x%x\t",prev_size(chunk));
-    printf("size_p=0x%x",chunk_size(chunk));
-    chunk+=chunk_size(chunk);
+  //void* chunk=heap_start;
+
+  if (freelist!=NULL){
+    void* tmp=(void*)fd(freelist);
+    while ((void*)fd(tmp)!=freelist){
+      //printf("1%zx->",chunk_size(fd(tmp)));
+      if((void*)bk(fd(tmp))!=tmp){
+        printf("Invalid fd detected\n");
+        exit(1);
+      }
+      tmp=(void*)fd(tmp);
+    }
   }
-  printf("\ntop=%p\t",chunk);
-  printf("prev_size_top=0x%x\t",prev_size(chunk));
-  printf("size_top=0x%x\n",chunk_size(chunk));
+  if(freelist!=NULL){
+    //puts("Entered Heap checker");
+    void* chunk=heap_start;
+    while(chunk!=top){
+      //printf("\np=%p\t",chunk);
+      // printf("prev_size_p=0x%x\t",prev_size(chunk));
+      // printf("size_p=0x%x",chunk_size(chunk));
+      if (chunk<mem_heap_lo() || chunk>mem_heap_hi()){
+        puts("\nHeap corrupted!!");
+      }
+      chunk+=real_size(chunk);
+    }
+  }
+  // printf("\ntop=%p\t",chunk);
+  // printf("prev_size_top=0x%x\t",prev_size(chunk));
+  // printf("size_top=0x%x\n",chunk_size(chunk));
 }
 
 /*
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
-{
+{   //req=0;
+    freelist=NULL;
     //printf("\n------%d\n----",SIZE_T_SIZE);
-    top=mem_sbrk(ALIGN(0x31000));
+    top=mem_sbrk((ssize_t)ALIGN((size_t)INIT_HEAP_SIZE));
     heap_start=top;
     if(top==(void*)-1){
       printf("\n[ERROR] mem_sbrk failed\n");
       exit(1);
     }
-    chunk_size(top) = (size_t)ALIGN(0x31000-2*WSIZE);
-    chunk_size(top) |=PREV_IN_USE;
+    chunk_size(top) = ALIGN((size_t)INIT_HEAP_SIZE-2*WSIZE);
+    //printf("top=%p\nhigh=%p\n",top,mem_heap_hi());
+    ALLOC(top);//chunk_size(top) |=PREV_IN_USE;
     ALLOC(next_chunk(top));
     freelist=mm_malloc(4*8*3);
     memset(freelist,0,96);
     fd(freelist)=(size_t)freelist;
     bk(freelist)=(size_t)freelist;
+    //puts("MEMINIT done");
     //mm_checkheap();
     return 0;
 }
@@ -108,18 +133,41 @@ int mm_init(void)
  */
 void *mm_malloc(size_t size)
 {
+    // printf("line=%d\n",req);
+    // req++;
     int newsize = ALIGN(size + SIZE_T_SIZE);
-    if(((int)chunk_size(top))<newsize){
-      printf("[ERROR] Out of memory !");
-      exit(1);
+    void* p=NULL;
+    if(freelist!=NULL){
+      p = traverse((size_t)newsize);
     }
-    void* p = top;
-    size_t prev=real_size(top);
-    top += newsize;
-    chunk_size(top)=prev-newsize;
-    chunk_size(p)=newsize;
-    ALLOC(top);
-    ALLOC(p);
+    if (p!=freelist){
+      unlink_from_freelist(p);
+      if(real_size(p)==newsize){
+        ALLOC(next_chunk(p));
+        //return p;
+      }
+      else{
+        chunk_size(p+newsize)=real_size(p)-newsize;
+        chunk_size(p)=newsize;
+        ALLOC(p);
+        ALLOC(next_chunk(p));
+        link_to_freelist(next_chunk(p));
+        prev_size((void*)next_chunk((void*)next_chunk(p)))=real_size((void*)next_chunk(p));
+      }
+    }
+    else if(!freelist || p==freelist){
+      if(((int)chunk_size(top))<newsize){
+        printf("[ERROR] Out of memory !");
+        exit(1);
+      }
+      p = top;
+      size_t prev=real_size(top);
+      top += newsize;
+      chunk_size(top)=prev-newsize;
+      chunk_size(p)=newsize;
+      ALLOC(top);
+      ALLOC(p);
+    }
     //mm_checkheap();
     return (void *)((char *)p + SIZE_T_SIZE);
 }
@@ -129,17 +177,21 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
-  //printf("%zx\n",(size_t)&chunk_size(next_chunk(ptr-0x10)));
+  // printf("line=%d\n",req);
+  // req++;
+  // //printf("%zx\n",(size_t)&chunk_size(next_chunk(ptr-0x10)));
   ptr = (void*)get_chunk(ptr);
   ptr = coalesce(ptr);
   if (ptr==NULL){
     ALLOC(top);
+    //mm_checkheap();
     return;
   }
   UNALLOC(next_chunk(ptr));
+  ALLOC(ptr);
   prev_size(next_chunk(ptr)) = real_size(ptr);
   link_to_freelist(ptr);
-
+  //mm_checkheap();
 }
 
 /*
@@ -162,11 +214,10 @@ void *mm_realloc(void *ptr, size_t size)
     return newptr;
 }
 
-void* traverse()
+void* traverse(size_t size)
 {
-    printf("%p\n",freelist);
-    void *tmp=freelist;
-    while((void*)fd(tmp)!=freelist){
+    void *tmp=(void*)fd(freelist);
+    while(real_size(tmp)<size && (tmp!=freelist)){
       tmp=(void*)fd(tmp);
     }
     return tmp;
@@ -192,15 +243,15 @@ void* coalesce(void* ptr)
   //void* tmp=next_chunk(ptr);
   size_t next_alloc=GET_ALLOC(next_chunk((void*)next_chunk(ptr)));
 
-  //printf("------%zx\n%zx----------%zx-----%p\n",prev_alloc,next_alloc,real_size(next_chunk(ptr)),ptr);
+  //printf("------%zx\n%zx----------%zx-----%p\n",prev_alloc,next_alloc);//,real_size(next_chunk(ptr)),ptr);
   // if(prev_alloc && next_alloc)
   //   return ptr;
 
   if(!prev_alloc && next_alloc){
-    chunk_size(prev_chunk(ptr)) += real_size(ptr);
+    chunk_size(prev_chunk(ptr)) = real_size(prev_chunk(ptr))+real_size(ptr);
     unlink_from_freelist(prev_chunk(ptr));
     ptr=prev_chunk(ptr);
-    prev_size(next_chunk(ptr))=chunk_size(prev_chunk(ptr));
+    //prev_size(next_chunk(ptr))=chunk_size(ptr);
   }
 
   if(next_chunk(ptr)==top){
@@ -212,16 +263,16 @@ void* coalesce(void* ptr)
   else if(prev_alloc && !next_alloc){
     unlink_from_freelist(next_chunk(ptr));
     chunk_size(ptr)=real_size(ptr)+real_size(next_chunk(ptr));
-    prev_size(next_chunk(ptr))=real_size(ptr);
+    //prev_size(next_chunk(ptr))=real_size(ptr);
   }
 
   else if(!prev_alloc && !next_alloc){
     unlink_from_freelist(next_chunk(ptr));
     unlink_from_freelist(prev_chunk(ptr));
     chunk_size(ptr)=real_size(ptr)+real_size(next_chunk(ptr));
-    chunk_size(prev_chunk(ptr)) += real_size(ptr);
+    chunk_size(prev_chunk(ptr)) = real_size(prev_chunk(ptr)) + real_size(ptr);
     ptr=prev_chunk(ptr);
-    prev_size(next_chunk(ptr))=real_size(ptr);
+    //prev_size(next_chunk(ptr))=real_size(ptr);
   }
 
   return ptr;
